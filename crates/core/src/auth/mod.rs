@@ -5,6 +5,8 @@ pub mod user;
 pub(crate) mod api;
 pub(crate) mod apple;
 pub(crate) mod create_external_user;
+pub(crate) mod google;
+pub(crate) mod jwks;
 pub(crate) mod login_params;
 pub(crate) mod oauth;
 pub(crate) mod options;
@@ -94,6 +96,12 @@ pub(super) fn auth_router(
   if config.auth.apple_native_client_id.is_some() {
     router = router.routes(routes!(
       api::apple_native_signin::apple_native_signin_handler
+    ));
+  }
+
+  if !config.auth.google_native_client_ids.is_empty() {
+    router = router.routes(routes!(
+      api::google_native_signin::google_native_signin_handler
     ));
   }
 
