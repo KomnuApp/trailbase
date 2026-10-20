@@ -421,10 +421,124 @@ fn write_contents(
       return (path.to_string(), err);
     };
 
-    let mut writer = store.put_multipart(&path).await.map_err(err)?;
+    let mut writer = put_multipart_with_content_type(&*store, &path, metadata.content_type())
+      .await
+      .map_err(err)?;
     writer.put_part(contents.into()).await.map_err(err)?;
     writer.complete().await.map_err(err)?;
 
     Ok(metadata)
   }));
+}
+
+/// Starts a multipart upload that stores the file's content type with the object, e.g. as S3's
+/// `Content-Type`, so that objects served directly from the bucket or a CDN have the right type
+/// rather than `application/octet-stream`.
+///
+/// Stores that don't support attributes, e.g. the local file system, fall back to a plain upload.
+async fn put_multipart_with_content_type(
+  store: &dyn ObjectStore,
+  path: &object_store::path::Path,
+  content_type: Option<&str>,
+) -> Result<Box<dyn object_store::MultipartUpload>, object_store::Error> {
+  let Some(content_type) = content_type else {
+    return store.put_multipart(path).await;
+  };
+
+  let mut attributes = object_store::Attributes::new();
+  attributes.insert(
+    object_store::Attribute::ContentType,
+    content_type.to_string().into(),
+  );
+
+  return match store
+    .put_multipart_opts(
+      path,
+      object_store::PutMultipartOptions {
+        attributes,
+        ..Default::default()
+      },
+    )
+    .await
+  {
+    Err(object_store::Error::NotImplemented { .. }) => store.put_multipart(path).await,
+    result => result,
+  };
+}
+
+#[cfg(test)]
+mod tests {
+  use object_store::{Attribute, ObjectStore, ObjectStoreExt};
+  use std::sync::Arc;
+  use trailbase_schema::json_schema::FileUpload;
+
+  use super::write_contents;
+
+  fn upload(mime_type: Option<&str>) -> FileUpload {
+    return FileUpload::new(
+      uuid::Uuid::now_v7(),
+      Some("photo.png".to_string()),
+      Some("image/jpeg".to_string()),
+      mime_type.map(|m| m.to_string()),
+    );
+  }
+
+  #[tokio::test]
+  async fn upload_stores_content_type_attribute() {
+    let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+
+    let metadata = write_contents(&store, upload(Some("image/png")), Some(b"png".to_vec()))
+      .unwrap()
+      .await
+      .unwrap();
+
+    let result = store
+      .get(&object_store::path::Path::from(metadata.objectstore_id()))
+      .await
+      .unwrap();
+    // The inferred mime type takes precedence over the user-provided content type.
+    assert_eq!(
+      result
+        .attributes
+        .get(&Attribute::ContentType)
+        .map(|v| v.as_ref()),
+      Some("image/png")
+    );
+    assert_eq!(&result.bytes().await.unwrap()[..], b"png");
+  }
+
+  #[tokio::test]
+  async fn upload_without_content_type_has_no_attribute() {
+    let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+    let metadata = FileUpload::new(uuid::Uuid::now_v7(), None, None, None);
+
+    let metadata = write_contents(&store, metadata, Some(b"x".to_vec()))
+      .unwrap()
+      .await
+      .unwrap();
+
+    let result = store
+      .get(&object_store::path::Path::from(metadata.objectstore_id()))
+      .await
+      .unwrap();
+    assert!(result.attributes.get(&Attribute::ContentType).is_none());
+  }
+
+  #[tokio::test]
+  async fn local_file_system_falls_back_to_plain_upload() {
+    let dir = temp_dir::TempDir::new().unwrap();
+    let store: Arc<dyn ObjectStore> =
+      Arc::new(object_store::local::LocalFileSystem::new_with_prefix(dir.path()).unwrap());
+
+    let metadata = write_contents(&store, upload(Some("image/png")), Some(b"png".to_vec()))
+      .unwrap()
+      .await
+      .unwrap();
+
+    let result = store
+      .get(&object_store::path::Path::from(metadata.objectstore_id()))
+      .await
+      .unwrap();
+    assert_eq!(&result.bytes().await.unwrap()[..], b"png");
+  }
 }
