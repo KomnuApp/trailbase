@@ -546,7 +546,25 @@ export interface AuthConfig {
    * / using their native `AuthenticationServices`:
    * /   https://acceptmy.app/guides/sign-in-with-apple-rejection.
    */
-  appleNativeClientId?: string | undefined;
+  appleNativeClientId?:
+    | string
+    | undefined;
+  /**
+   * / Similar to "Sign-in with Apple" above, native Android and iOS apps can
+   * / sign in with Google directly, e.g. using Android's Credential Manager or
+   * / Google's iOS SDK, and then exchange the resulting Google-signed ID token
+   * / for TrailBase auth tokens.
+   * /
+   * / The token's audience (`aud`) is validated against this list of OAuth
+   * / client ids. Note that Android's Credential Manager issues tokens for the
+   * / "server client id", i.e. typically the same "Web application" client id
+   * / as used by the web OAuth flow, while the iOS SDK issues tokens for the
+   * / iOS client id:
+   * /   https://developers.google.com/identity/gsi/web/guides/verify-google-id-token
+   * /
+   * / Native sign-in is disabled while the list is empty.
+   */
+  googleNativeClientIds: string[];
 }
 
 export interface AuthConfig_OauthProvidersEntry {
@@ -1338,7 +1356,7 @@ export const OAuthProviderConfig: MessageFns<OAuthProviderConfig> = {
 };
 
 function createBaseAuthConfig(): AuthConfig {
-  return { oauthProviders: {}, customUriSchemes: [], redirectUriAllowlist: [] };
+  return { oauthProviders: {}, customUriSchemes: [], redirectUriAllowlist: [], googleNativeClientIds: [] };
 }
 
 export const AuthConfig: MessageFns<AuthConfig> = {
@@ -1404,6 +1422,9 @@ export const AuthConfig: MessageFns<AuthConfig> = {
     }
     if (message.appleNativeClientId !== undefined && message.appleNativeClientId !== "") {
       writer.uint32(258).string(message.appleNativeClientId);
+    }
+    for (const v of message.googleNativeClientIds) {
+      writer.uint32(266).string(v!);
     }
     return writer;
   },
@@ -1544,6 +1565,14 @@ export const AuthConfig: MessageFns<AuthConfig> = {
             message.appleNativeClientId = reader.string();
             continue;
           }
+          case 33: {
+            if (tag !== 266) {
+              break;
+            }
+
+            message.googleNativeClientIds.push(reader.string());
+            continue;
+          }
         }
         if ((tag & 7) === 4 || tag === 0) {
           break;
@@ -1655,6 +1684,11 @@ export const AuthConfig: MessageFns<AuthConfig> = {
         : isSet(object.apple_native_client_id)
         ? globalThis.String(object.apple_native_client_id)
         : undefined,
+      googleNativeClientIds: globalThis.Array.isArray(object?.googleNativeClientIds)
+        ? object.googleNativeClientIds.map((e: any) => globalThis.String(e))
+        : globalThis.Array.isArray(object?.google_native_client_ids)
+        ? object.google_native_client_ids.map((e: any) => globalThis.String(e))
+        : [],
     };
   },
 
@@ -1717,6 +1751,9 @@ export const AuthConfig: MessageFns<AuthConfig> = {
     if (message.appleNativeClientId !== undefined && message.appleNativeClientId !== "") {
       obj.appleNativeClientId = message.appleNativeClientId;
     }
+    if (message.googleNativeClientIds?.length) {
+      obj.googleNativeClientIds = message.googleNativeClientIds;
+    }
     return obj;
   },
 
@@ -1753,6 +1790,7 @@ export const AuthConfig: MessageFns<AuthConfig> = {
     message.redirectUriAllowlist = object.redirectUriAllowlist?.map((e) => e) || [];
     message.userIdentifier = object.userIdentifier ?? 0;
     message.appleNativeClientId = object.appleNativeClientId ?? "";
+    message.googleNativeClientIds = object.googleNativeClientIds?.map((e) => e) || [];
     return message;
   },
 };
