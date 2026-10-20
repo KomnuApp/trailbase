@@ -169,6 +169,11 @@ pub struct ServerArgs {
   #[arg(long, env)]
   pub runtime_threads: Option<usize>,
 
+  /// Number of threads of the main database's connection pool: one writer plus readers, capped at
+  /// #cpus (Default: #cpus clamped to [2, 4]).
+  #[arg(long, env)]
+  pub db_threads: Option<usize>,
+
   /// Optional list of additional WASM components to load besides `<depot>/wasm/*.wasm`.
   #[arg(long, env, value_hint = ValueHint::FilePath)]
   pub runtime_extra_components: Option<Vec<std::path::PathBuf>>,

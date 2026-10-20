@@ -77,6 +77,8 @@ struct ConnectionManagerState {
   json_schema_registry: Arc<trailbase_schema::json_schema::registry::JsonSchemaRegistry>,
   sqlite_function_runtimes: Vec<(SqliteStore, Vec<SqliteFunction>)>,
   read_only: bool,
+  /// Thread count for new main-DB connections, see `Options::num_threads`.
+  num_threads: Option<usize>,
 
   // Properties for caching connections:
   main: ArcSwap<ConnectionEntry>,
@@ -104,6 +106,8 @@ pub struct Options {
   pub sqlite_function_runtimes: Vec<(SqliteStore, Vec<SqliteFunction>)>,
   pub pg_uri: Option<String>,
   pub read_only: Option<bool>,
+  /// Number of threads for main database connections. Defaults to #cpus clamped to [2, 4].
+  pub num_threads: Option<usize>,
 }
 
 #[derive(Debug, Default)]
@@ -121,6 +125,7 @@ impl ConnectionManager {
       sqlite_function_runtimes,
       pg_uri,
       read_only,
+      num_threads,
     } = opts;
 
     let (main_conn, main_metadata, new_db) = init_db(
@@ -137,7 +142,7 @@ impl ConnectionManager {
         json_registry: &json_schema_registry,
         runtimes: &sqlite_function_runtimes,
         attach: vec![],
-        num_threads: None,
+        num_threads,
         read_only,
       },
     )
@@ -150,6 +155,7 @@ impl ConnectionManager {
           json_schema_registry,
           sqlite_function_runtimes,
           read_only: read_only.unwrap_or(false),
+          num_threads,
           main: ArcSwap::from_pointee(ConnectionEntry {
             connection: main_conn,
             metadata: Arc::new(main_metadata),
@@ -200,6 +206,7 @@ impl ConnectionManager {
         json_schema_registry,
         sqlite_function_runtimes,
         read_only: READ_ONLY,
+        num_threads: None,
         main: ArcSwap::from_pointee(ConnectionEntry {
           connection: main_conn,
           metadata: Arc::new(main_metadata),
@@ -352,7 +359,7 @@ impl ConnectionManager {
         json_registry: &self.state.json_schema_registry,
         runtimes: &self.state.sqlite_function_runtimes,
         attach,
-        num_threads: opts.num_threads,
+        num_threads: opts.num_threads.or(self.state.num_threads),
         read_only: Some(self.state.read_only),
       },
     )
