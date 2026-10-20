@@ -165,6 +165,21 @@ message AuthConfig {
   /// using their native `AuthenticationServices`:
   ///   https://acceptmy.app/guides/sign-in-with-apple-rejection.
   optional string apple_native_client_id = 32;
+
+  /// Similar to "Sign-in with Apple" above, native Android and iOS apps can
+  /// sign in with Google directly, e.g. using Android's Credential Manager or
+  /// Google's iOS SDK, and then exchange the resulting Google-signed ID token
+  /// for TrailBase auth tokens.
+  ///
+  /// The token's audience (`aud`) is validated against this list of OAuth
+  /// client ids. Note that Android's Credential Manager issues tokens for the
+  /// "server client id", i.e. typically the same "Web application" client id
+  /// as used by the web OAuth flow, while the iOS SDK issues tokens for the
+  /// iOS client id:
+  ///   https://developers.google.com/identity/gsi/web/guides/verify-google-id-token
+  ///
+  /// Native sign-in is disabled while the list is empty.
+  repeated string google_native_client_ids = 33;
 }
 
 message S3StorageConfig {

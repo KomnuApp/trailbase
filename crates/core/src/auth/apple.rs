@@ -1,29 +1,11 @@
-use futures_util::FutureExt;
-use futures_util::future::{BoxFuture, Shared};
-use parking_lot::Mutex;
 use serde::Deserialize;
-use std::sync::LazyLock;
-use std::time::{Duration, SystemTime};
 
 use crate::auth::AuthError;
+use crate::auth::jwks::{JwkSet, decode_and_validate_id_token};
+#[cfg(not(test))]
+use crate::auth::jwks::{JwkSetCache, fetch_cached, fetch_jwks};
 
-/// RFC: https://www.rfc-editor.org/info/rfc7517/#section-4
-#[allow(unused)]
-#[derive(Clone, Debug, Deserialize)]
-struct Jwk {
-  kty: String,
-  kid: String,
-  r#use: String,
-  alg: String,
-  n: String,
-  e: String,
-}
-
-/// RFC: https://www.rfc-editor.org/info/rfc7517/#section-5
-#[derive(Clone, Debug, Deserialize)]
-struct JwkSet {
-  keys: Vec<Jwk>,
-}
+const APPLE_ISSUER: &str = "https://appleid.apple.com";
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(untagged)]
@@ -59,23 +41,6 @@ pub struct AppleIdToken {
   // pub iat: i64,
 }
 
-/// Extracts the `kid` header from a JWT without any network access.
-pub fn extract_kid(id_token: &str) -> Result<String, AuthError> {
-  let Ok(header) = jsonwebtoken::decode_header(id_token) else {
-    return Err(AuthError::BadRequest("malformed identity token"));
-  };
-
-  if let Some(kid) = header.kid
-    && !kid.is_empty()
-  {
-    return Ok(kid);
-  }
-
-  return Err(AuthError::BadRequest(
-    "identity token is missing the kid header",
-  ));
-}
-
 /// Verifies signature and claims (issuer, audience, expiry) of an Apple
 /// identity token against the given public keys, selecting the key by `kid`.
 ///
@@ -86,33 +51,7 @@ fn decode_and_validate_apple_id_token_impl(
   id_token: &str,
   audience: &str,
 ) -> Result<AppleIdToken, AuthError> {
-  let kid = extract_kid(id_token)?;
-
-  // Find the key.
-  let Some(public_key) = public_keys.keys.iter().find(|key| key.kid == kid) else {
-    return Err(AuthError::Unauthorized);
-  };
-
-  let decoding_key = jsonwebtoken::DecodingKey::from_rsa_components(&public_key.n, &public_key.e)
-    .map_err(|err| {
-    // Got invalid key from Apple?
-    return AuthError::FailedDependency(err.into());
-  })?;
-
-  let validation = {
-    let mut validation = jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::RS256);
-    validation.set_audience(&[audience]);
-    validation.set_issuer(&["https://appleid.apple.com"]);
-    validation
-  };
-
-  let token_data = jsonwebtoken::decode::<AppleIdToken>(id_token, &decoding_key, &validation)
-    .map_err(|_err| {
-      // Validation failed.
-      return AuthError::Unauthorized;
-    })?;
-
-  return Ok(token_data.claims);
+  return decode_and_validate_id_token(public_keys, id_token, &[APPLE_ISSUER], &[audience]);
 }
 
 #[cfg(not(test))]
@@ -121,18 +60,11 @@ pub(crate) async fn decode_and_validate_apple_id_token(
   id_token: &str,
   audience: &str,
 ) -> Result<AppleIdToken, AuthError> {
-  async fn fetch(http_client: reqwest::Client) -> Result<JwkSet, String> {
-    const JWK_URL: &str = "https://appleid.apple.com/auth/keys";
-    let response = http_client
-      .get(JWK_URL)
-      .send()
-      .await
-      .map_err(|err| err.to_string())?;
+  const JWK_URL: &str = "https://appleid.apple.com/auth/keys";
+  static CACHE: std::sync::LazyLock<JwkSetCache> =
+    std::sync::LazyLock::new(|| parking_lot::Mutex::new(None));
 
-    return response.json().await.map_err(|err| err.to_string());
-  }
-
-  let keys = fetch_cached(fetch, http_client)
+  let keys = fetch_cached(&CACHE, |client| fetch_jwks(client, JWK_URL), http_client)
     .await
     .map_err(|err| AuthError::FailedDependency(err.into()))?;
 
@@ -145,73 +77,20 @@ pub(crate) async fn decode_and_validate_apple_id_token(
   id_token: &str,
   audience: &str,
 ) -> Result<AppleIdToken, AuthError> {
-  let keys = test_support::fixture_keys();
+  let keys = crate::auth::jwks::test_support::fixture_keys();
   return decode_and_validate_apple_id_token_impl(&keys, id_token, audience);
 }
 
-async fn fetch_cached<F, Fut>(fetch: F, http_client: &reqwest::Client) -> Result<JwkSet, String>
-where
-  F: (Fn(reqwest::Client) -> Fut) + Send + 'static,
-  Fut: Future<Output = Result<JwkSet, String>> + Send,
-{
-  type Cached = Option<(
-    SystemTime,
-    Shared<BoxFuture<'static, Result<JwkSet, String>>>,
-  )>;
-
-  static CACHE: LazyLock<Mutex<Cached>> = LazyLock::new(|| Mutex::new(None));
-
-  let now = SystemTime::now();
-  let is_valid = |ts: SystemTime| -> bool {
-    return now
-      .duration_since(ts)
-      .is_ok_and(|d| d < Duration::from_mins(15));
-  };
-
-  let future = {
-    let mut lock = CACHE.lock();
-    if let Some((ref ts, ref future)) = *lock
-      && is_valid(*ts)
-    {
-      future.clone()
-    } else {
-      let http_client = http_client.clone();
-      let future = async move {
-        fetch(http_client).await.map_err(|err| {
-          // Invalidate cache. Defensively avoid deadlocking even if `fetch` returns synchronously.
-          if let Some(mut lock) = CACHE.try_lock_for(Duration::from_millis(10)) {
-            *lock = None;
-          }
-
-          return err;
-        })
-      }
-      .boxed()
-      .shared();
-
-      *lock = Some((now, future.clone()));
-
-      future
-    }
-  };
-
-  // Await w/o holding the lock.
-  return future.await;
-}
-
 /// Fixture shared by the native-verification tests here and the endpoint
-/// tests in `apple_native.rs`.
+/// tests in `apple_native_signin.rs`.
 #[cfg(test)]
 pub mod test_support {
-  use base64::prelude::*;
-  use rsa::RsaPrivateKey;
-  use rsa::pkcs8::EncodePrivateKey;
-  use rsa::traits::PublicKeyParts;
   use std::sync::LazyLock;
 
-  use super::*;
+  use super::APPLE_ISSUER;
 
-  pub const TEST_KEY_ID: &str = "test-apple-key-1";
+  pub use crate::auth::jwks::test_support::{sign_token, signing_jwt_key};
+
   pub const APP_ID: &str = "org.test";
   pub static NONCE_HASH: LazyLock<String> = LazyLock::new(|| {
     use sha2::{Digest, Sha256};
@@ -220,50 +99,9 @@ pub mod test_support {
     return hex::encode(hasher.finalize());
   });
 
-  /// RSA private key standing in for Apple's signing key.
-  fn signing_key() -> &'static RsaPrivateKey {
-    static KEY: LazyLock<RsaPrivateKey> = LazyLock::new(|| {
-      let mut rng = rand::rng();
-      return RsaPrivateKey::new(&mut rng, 2048).unwrap();
-    });
-
-    return &KEY;
-  }
-
-  pub fn signing_jwt_key() -> jsonwebtoken::EncodingKey {
-    let pem = signing_key().to_pkcs8_pem(Default::default()).unwrap();
-    return jsonwebtoken::EncodingKey::from_rsa_pem(pem.as_bytes()).unwrap();
-  }
-
-  pub(super) fn fixture_keys() -> JwkSet {
-    let key = signing_key();
-    let apple_key = Jwk {
-      kty: "RSA".to_string(),
-      kid: TEST_KEY_ID.to_string(),
-      r#use: "sig".to_string(),
-      alg: "RS256".to_string(),
-      n: BASE64_URL_SAFE_NO_PAD.encode(key.n().to_be_bytes()),
-      e: BASE64_URL_SAFE_NO_PAD.encode(key.e().to_be_bytes()),
-    };
-
-    return JwkSet {
-      keys: vec![apple_key],
-    };
-  }
-
-  pub fn sign_token(claims: serde_json::Value) -> String {
-    let key = signing_jwt_key();
-    let header = jsonwebtoken::Header {
-      alg: jsonwebtoken::Algorithm::RS256,
-      kid: Some(TEST_KEY_ID.to_string()),
-      ..Default::default()
-    };
-    return jsonwebtoken::encode(&header, &claims, &key).unwrap();
-  }
-
   pub fn valid_claims() -> serde_json::Value {
     return serde_json::json!({
-      "iss": "https://appleid.apple.com",
+      "iss": APPLE_ISSUER,
       "aud": APP_ID,
       "exp": (chrono::Utc::now() + chrono::Duration::minutes(10)).timestamp(),
       "iat": chrono::Utc::now().timestamp(),
@@ -277,12 +115,9 @@ pub mod test_support {
 
 #[cfg(test)]
 mod tests {
-  use std::sync::atomic::{AtomicUsize, Ordering};
-
-  use base64::prelude::*;
-
   use super::test_support::*;
   use super::*;
+  use crate::auth::jwks::test_support::fixture_keys;
 
   #[test]
   fn test_apple_boolean() {
@@ -370,51 +205,5 @@ mod tests {
       decode_and_validate_apple_id_token_impl(&fixture_keys(), &token, APP_ID),
       Err(AuthError::Unauthorized)
     ));
-  }
-
-  #[test]
-  fn test_extract_kid() {
-    assert!(extract_kid("garbage").is_err());
-    // Well-formed base64 header without a kid field.
-    let header = BASE64_URL_SAFE_NO_PAD.encode(r#"{"alg":"RS256"}"#);
-    assert!(extract_kid(&format!("{header}.bbb.ccc")).is_err());
-
-    let token = sign_token(valid_claims());
-    assert_eq!(extract_kid(&token).unwrap(), TEST_KEY_ID);
-  }
-
-  #[tokio::test]
-  async fn test_cache() {
-    let http_client = reqwest::Client::new();
-
-    type ResultType = Result<JwkSet, String>;
-
-    static CALLED: AtomicUsize = AtomicUsize::new(0);
-    static RESULT: LazyLock<parking_lot::Mutex<ResultType>> =
-      LazyLock::new(|| parking_lot::Mutex::new(Err("default".to_string())));
-
-    async fn fetch(_: reqwest::Client) -> ResultType {
-      CALLED.fetch_add(1, Ordering::SeqCst);
-      return RESULT.lock().clone();
-    }
-
-    // Make sure, errors are not cached.
-    let f0 = fetch_cached(fetch, &http_client);
-    let f1 = fetch_cached(fetch, &http_client);
-    assert!(f0.await.is_err());
-    assert!(f1.await.is_err());
-    assert_eq!(2, CALLED.load(Ordering::SeqCst));
-
-    assert!(fetch_cached(fetch, &http_client).await.is_err());
-    assert_eq!(3, CALLED.load(Ordering::SeqCst));
-
-    *RESULT.lock() = Ok(JwkSet { keys: vec![] });
-
-    // Make sure success is cached.
-    assert!(fetch_cached(fetch, &http_client).await.is_ok());
-    assert_eq!(4, CALLED.load(Ordering::SeqCst));
-
-    assert!(fetch_cached(fetch, &http_client).await.is_ok());
-    assert_eq!(4, CALLED.load(Ordering::SeqCst));
   }
 }
