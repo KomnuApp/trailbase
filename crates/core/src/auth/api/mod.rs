@@ -4,6 +4,7 @@ pub(super) mod change_email;
 pub(super) mod change_password;
 pub(super) mod change_username;
 pub(super) mod delete;
+pub(super) mod google_native_signin;
 pub(crate) mod login;
 pub(super) mod login_anonymous;
 pub(super) mod logout;

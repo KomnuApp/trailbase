@@ -120,7 +120,10 @@ pub(crate) async fn apple_native_signin_handler(
 
 /// Checks the anti-replay nonce (sha256 hex-encoded) in the claims against the client's raw nonce
 /// (the hash the client sent with the authorization request).
-fn verify_nonce_claim(claims_nonce: Option<&str>, client_nonce: &str) -> Result<(), AuthError> {
+pub(super) fn verify_nonce_claim(
+  claims_nonce: Option<&str>,
+  client_nonce: &str,
+) -> Result<(), AuthError> {
   let Some(claims_nonce) = claims_nonce.and_then(|n| hex::decode(n).ok()) else {
     return Err(AuthError::BadRequest("identity token misses valid nonce"));
   };
