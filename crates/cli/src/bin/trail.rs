@@ -71,6 +71,7 @@ async fn async_main(
         wasm_extra_components: cmd.runtime_extra_components,
         wasm_filesystem_root: cmd.runtime_root_fs.clone(),
         pg_uri: cmd.experimental_pg.clone(),
+        db_threads: cmd.db_threads,
       })
       .await?;
 
