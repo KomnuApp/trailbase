@@ -49,6 +49,10 @@ pub struct InitArgs {
 
   /// Optional postgre URI, if an external postgres instance should be used instead of SQLite.
   pub pg_uri: Option<String>,
+
+  /// Optional number of threads for the main database's connection pool (one writer plus readers).
+  /// Defaults to #cpus clamped to [2, 4].
+  pub db_threads: Option<usize>,
 }
 
 /// The app's internal state. AppState needs to be clonable which puts unnecessary constraints on
@@ -144,6 +148,7 @@ impl AppState {
         _ => None,
       },
       read_only: Some(args.read_only),
+      num_threads: args.db_threads,
     })
     .await?;
 
