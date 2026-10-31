@@ -1,6 +1,6 @@
 use crossfire;
 use log::*;
-use parking_lot::RwLock;
+use parking_lot::Mutex;
 use std::sync::Arc;
 
 use crate::error::Error;
@@ -8,14 +8,19 @@ use crate::params::Params;
 
 pub use crate::sqlite::lock::{ArcLockGuard, LockError, LockGuard};
 
-#[derive(Default)]
-pub(super) struct ConnectionVec(pub(super) smallvec::SmallVec<[rusqlite::Connection; 32]>);
+/// One connection behind its own lock. `None` once the executor is closed.
+///
+/// Every connection has its own lock, so readers never wait on the writer: SQLite in WAL mode
+/// already isolates readers from the writer. A single lock over all connections made every write
+/// (and every WASM guest transaction, which holds the writer for its whole life) stall all reads.
+///
+/// NOTE: A connection must never be used concurrently, even as immutable &Connection, due to its
+/// intrinsic statement cache. The lock guarantees that: the writer connection is shared by the
+/// writer thread and `LockGuard`/`ArcLockGuard` owners, each reader connection by its own reader
+/// thread, and every connection by `map()` and `close_impl()`.
+pub(super) type ConnectionSlot = Arc<Mutex<Option<rusqlite::Connection>>>;
 
-// Unsafe `Sync` implementation to allow concurrent read access via RwLock.
-// WARN: We must never access the same connection concurrently even as immutable &Connection, due
-// to intrinsic statement cache. We can ensure this by uniquely assigning one connection to each
-// thread.
-unsafe impl Sync for ConnectionVec {}
+const CLOSED: &str = "connection closed";
 
 enum ReaderMessage {
   RunConst(Box<dyn FnOnce(&rusqlite::Connection) + Send>),
@@ -42,9 +47,9 @@ type MpscReceiver<T> = crossfire::Rx<crossfire::mpsc::List<T>>;
 pub(crate) struct Executor {
   reader: MpmcSender<ReaderMessage>,
   writer: MpscSender<WriterMessage>,
-  // NOTE: Is shared across reader and writer worker threads.
-  // NOTE: Only needs to be an to get parking_lot's owned ArcLocks.
-  conns: Arc<RwLock<ConnectionVec>>,
+  // Index 0 is the writer connection, the rest are the reader connections. Locks are always taken
+  // in index order.
+  conns: Vec<ConnectionSlot>,
 }
 
 impl Drop for Executor {
@@ -113,16 +118,16 @@ impl Executor {
     assert!(num_threads > 0);
 
     let num_read_threads = num_threads - 1;
-    let conns = Arc::new(RwLock::new(ConnectionVec({
+    let conns: Vec<ConnectionSlot> = {
       let mut conns = Vec::with_capacity(num_threads);
-      conns.push(write_conn);
+      conns.push(Arc::new(Mutex::new(Some(write_conn))));
       for _ in 0..num_read_threads {
-        conns.push(new_conn(/* read_only= */ true)?);
+        conns.push(Arc::new(Mutex::new(Some(new_conn(/* read_only= */ true)?))));
       }
-      conns.into()
-    })));
+      conns
+    };
 
-    assert_eq!(num_threads, conns.read().0.len());
+    assert_eq!(num_threads, conns.len());
 
     let (shared_write_sender, shared_write_receiver) =
       crossfire::mpsc::unbounded_blocking::<WriterMessage>();
@@ -134,9 +139,9 @@ impl Executor {
       .name("tb-sqlite-0 (rw)".to_string())
       .spawn({
         let shared_read_receiver = shared_read_receiver.clone();
-        let conns = conns.clone();
+        let conn = conns[0].clone();
 
-        move || writer_event_loop(conns, shared_read_receiver, shared_write_receiver)
+        move || writer_event_loop(conn, shared_read_receiver, shared_write_receiver)
       })
       .map_err(|err| Error::Other(format!("spawning rw thread failed: {err}").into()))?;
 
@@ -146,9 +151,9 @@ impl Executor {
         .name(format!("tb-sqlite-{index} (ro)"))
         .spawn({
           let shared_read_receiver = shared_read_receiver.clone();
-          let conns = conns.clone();
+          let conn = conns[index + 1].clone();
 
-          move || reader_event_loop(index + 1, conns, shared_read_receiver)
+          move || reader_event_loop(conn, shared_read_receiver)
         })
         .map_err(|err| Error::Other(format!("spawning ro thread {index} failed: {err}").into()))?;
     }
@@ -170,17 +175,17 @@ impl Executor {
   }
 
   pub fn threads(&self) -> usize {
-    return self.conns.read().0.len();
+    return self.conns.len();
   }
 
   pub fn path(&self) -> Option<String> {
-    let lock = self.conns.read();
-    return lock.0.get(0).and_then(|c| c.path().map(String::from));
+    let lock = self.conns[0].lock();
+    return lock.as_ref().and_then(|c| c.path().map(String::from));
   }
 
   #[inline]
   pub fn write_lock(&self) -> Result<LockGuard<'_>, LockError> {
-    return Ok(LockGuard::new(self.conns.write()));
+    return Ok(LockGuard::new(self.conns[0].lock()));
   }
 
   #[inline]
@@ -189,20 +194,20 @@ impl Executor {
     duration: tokio::time::Duration,
   ) -> Result<ArcLockGuard, LockError> {
     return Ok(ArcLockGuard {
-      guard: self
-        .conns
-        .try_write_arc_for(duration)
+      guard: self.conns[0]
+        .try_lock_arc_for(duration)
         .ok_or(LockError::Timeout)?,
     });
   }
 
+  /// Applies `f` to every connection while holding all of their locks.
   #[inline]
   pub(crate) fn map(
     &self,
     f: impl Fn(&rusqlite::Connection) -> Result<(), Error> + Send + 'static,
   ) -> Result<(), Error> {
-    let lock = self.conns.write();
-    for conn in &lock.0 {
+    let locks: Vec<_> = self.conns.iter().map(|c| c.lock()).collect();
+    for conn in locks.iter().filter_map(|lock| lock.as_ref()) {
       f(conn)?;
     }
     return Ok(());
@@ -304,8 +309,10 @@ impl Executor {
     }
 
     let mut errors = vec![];
-    let conns: ConnectionVec = std::mem::take(&mut self.conns.write());
-    for conn in conns.0 {
+    for slot in &self.conns {
+      let Some(conn) = slot.lock().take() else {
+        continue;
+      };
       // NOTE: rusqlite's `Connection::close()` returns itself, to allow users to retry
       // failed closes. We on the other, may be left in a partially closed state with multiple
       // connections. Ignorance is bliss.
@@ -325,16 +332,12 @@ impl Executor {
   }
 }
 
-fn reader_event_loop(
-  idx: usize,
-  conns: Arc<RwLock<ConnectionVec>>,
-  receiver: MpmcReceiver<ReaderMessage>,
-) {
+fn reader_event_loop(conn: ConnectionSlot, receiver: MpmcReceiver<ReaderMessage>) {
   while let Ok(message) = receiver.recv() {
     match message {
       ReaderMessage::RunConst(f) => {
-        let lock = conns.read();
-        f(&lock.0[idx])
+        let lock = conn.lock();
+        f(lock.as_ref().expect(CLOSED))
       }
       ReaderMessage::Terminate => {
         return;
@@ -346,7 +349,7 @@ fn reader_event_loop(
 }
 
 fn writer_event_loop(
-  conns: Arc<RwLock<ConnectionVec>>,
+  conn: ConnectionSlot,
   reader_receiver: MpmcReceiver<ReaderMessage>,
   writer_receiver: MpscReceiver<WriterMessage>,
 ) {
@@ -361,8 +364,8 @@ fn writer_event_loop(
           Ok(m) => match m {
             ReaderMessage::Terminate => break,
             ReaderMessage::RunConst(f) => {
-              let lock = conns.read();
-              f(&lock.0[0]);
+              let lock = conn.lock();
+              f(lock.as_ref().expect(CLOSED));
             }
           },
           Err(crossfire::RecvError) => {
@@ -375,8 +378,8 @@ fn writer_event_loop(
         match writer_receiver.read_select(rx) {
           Ok(m) => match m {
             WriterMessage::RunMut(f) => {
-              let mut lock = conns.write();
-              f(&mut lock.0[0]);
+              let mut lock = conn.lock();
+              f(lock.as_mut().expect(CLOSED));
             }
           },
           Err(crossfire::RecvError) => {

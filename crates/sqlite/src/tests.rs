@@ -734,3 +734,86 @@ async fn test_backup() {
 
   assert_eq!(1, count("test").await);
 }
+
+/// Every connection has its own lock, so reads keep running on the reader connections while the
+/// writer is held, e.g. by a WASM guest transaction, and see only committed data.
+#[tokio::test]
+async fn reads_run_while_writer_is_held_test() {
+  use crate::sqlite::transaction::OwnedTx;
+  use crate::traits::SyncTransaction;
+  use std::time::Duration;
+
+  let tmp_dir = tempfile::TempDir::new().unwrap();
+  let db_path = tmp_dir.path().join("main.sqlite");
+
+  let conn = Connection::with_opts(
+    move || -> Result<rusqlite::Connection, Error> {
+      let conn = rusqlite::Connection::open(&db_path)?;
+      conn.pragma_update(None, "journal_mode", "WAL")?;
+      return Ok(conn);
+    },
+    Options {
+      num_threads: Some(3),
+      ..Default::default()
+    },
+  )
+  .unwrap();
+
+  conn
+    .execute("CREATE TABLE t (id INTEGER PRIMARY KEY)", ())
+    .await
+    .unwrap();
+  conn
+    .execute("INSERT INTO t (id) VALUES (1)", ())
+    .await
+    .unwrap();
+
+  // Hold the writer the way a guest transaction does, with an uncommitted write.
+  let lock = conn
+    .try_write_arc_lock_for(Duration::from_secs(1))
+    .unwrap();
+  let mut tx = OwnedTx::new(lock).unwrap();
+  tx.execute("INSERT INTO t (id) VALUES (2)", ()).unwrap();
+  assert_eq!(
+    Some(2),
+    tx.query_row("SELECT COUNT(*) FROM t", ())
+      .unwrap()
+      .map(|row| row.get::<i64>(0).unwrap()),
+    "the transaction sees its own write"
+  );
+
+  // The writer thread serves reads too, so it may take one read and wait for the transaction.
+  // Every other read must finish on a reader connection.
+  const READS: usize = 8;
+  let counts: Vec<i64> = join_all((0..READS).map(|_| {
+    tokio::time::timeout(
+      Duration::from_secs(2),
+      conn.read_query_row_get::<i64>("SELECT COUNT(*) FROM t", (), 0),
+    )
+  }))
+  .await
+  .into_iter()
+  .filter_map(|result| result.ok())
+  .map(|count| count.unwrap().unwrap())
+  .collect();
+
+  assert!(
+    counts.len() >= READS - 1,
+    "only {} of {READS} reads finished while the writer was held",
+    counts.len()
+  );
+  assert!(
+    counts.iter().all(|count| *count == 1),
+    "reads saw uncommitted data: {counts:?}"
+  );
+
+  tx.commit().unwrap();
+
+  assert_eq!(
+    Some(2),
+    conn
+      .read_query_row_get::<i64>("SELECT COUNT(*) FROM t", (), 0)
+      .await
+      .unwrap()
+  );
+}
