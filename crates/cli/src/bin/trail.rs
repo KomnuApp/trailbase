@@ -3,6 +3,91 @@
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
+/// Routes SQLite's own allocations (page cache, statements, results) through mimalloc as well.
+///
+/// SQLite is built with SYSTEM_MALLOC, so by default it calls libc `malloc`. In the static musl
+/// build that is musl's malloc, which serialises every connection on one lock. mimalloc is already
+/// linked as the Rust global allocator above, so no new dependency is needed.
+mod sqlite_malloc {
+  use std::ffi::{c_int, c_void};
+
+  // Provided by libmimalloc-sys, which the `mimalloc` crate links.
+  unsafe extern "C" {
+    fn mi_malloc(size: usize) -> *mut c_void;
+    fn mi_free(p: *mut c_void);
+    fn mi_realloc(p: *mut c_void, newsize: usize) -> *mut c_void;
+    fn mi_usable_size(p: *const c_void) -> usize;
+    fn mi_good_size(size: usize) -> usize;
+  }
+
+  // SQLite never passes a negative size; clamp rather than wrap to a huge usize.
+  fn to_usize(n: c_int) -> usize {
+    n.max(0) as usize
+  }
+
+  // mimalloc may round a request close to 2 GiB past c_int::MAX. The clamped value is still at
+  // least the requested size, which is all SQLite needs from xSize and xRoundup.
+  fn to_int(n: usize) -> c_int {
+    n.min(c_int::MAX as usize) as c_int
+  }
+
+  unsafe extern "C" fn x_malloc(n: c_int) -> *mut c_void {
+    unsafe { mi_malloc(to_usize(n)) }
+  }
+
+  unsafe extern "C" fn x_free(p: *mut c_void) {
+    unsafe { mi_free(p) }
+  }
+
+  // mi_realloc handles any size, including growing past the current block and a null pointer.
+  unsafe extern "C" fn x_realloc(p: *mut c_void, n: c_int) -> *mut c_void {
+    unsafe { mi_realloc(p, to_usize(n)) }
+  }
+
+  // No size header: mimalloc knows each block's usable size, which is >= the requested size.
+  unsafe extern "C" fn x_size(p: *mut c_void) -> c_int {
+    to_int(unsafe { mi_usable_size(p) })
+  }
+
+  unsafe extern "C" fn x_roundup(n: c_int) -> c_int {
+    to_int(unsafe { mi_good_size(to_usize(n)) })
+  }
+
+  unsafe extern "C" fn x_init(_: *mut c_void) -> c_int {
+    rusqlite::ffi::SQLITE_OK
+  }
+
+  unsafe extern "C" fn x_shutdown(_: *mut c_void) {}
+
+  /// Must run before SQLite initialises, i.e. before the first connection or
+  /// `sqlite3_auto_extension`. On failure SQLite keeps its default allocator, which still works.
+  pub fn install() {
+    let methods = rusqlite::ffi::sqlite3_mem_methods {
+      xMalloc: Some(x_malloc),
+      xFree: Some(x_free),
+      xRealloc: Some(x_realloc),
+      xSize: Some(x_size),
+      xRoundup: Some(x_roundup),
+      xInit: Some(x_init),
+      xShutdown: Some(x_shutdown),
+      pAppData: std::ptr::null_mut(),
+    };
+    // SQLite copies the struct, so `methods` may go out of scope afterwards.
+    let rc = unsafe {
+      rusqlite::ffi::sqlite3_config(
+        rusqlite::ffi::SQLITE_CONFIG_MALLOC,
+        &methods as *const rusqlite::ffi::sqlite3_mem_methods,
+      )
+    };
+    if rc != rusqlite::ffi::SQLITE_OK {
+      // Logging is not set up yet this early.
+      eprintln!(
+        "warning: sqlite3_config(SQLITE_CONFIG_MALLOC) failed with code {rc}; SQLite keeps its default allocator"
+      );
+    }
+  }
+}
+
 use base64::prelude::*;
 use chrono::TimeZone;
 use clap::{CommandFactory, Parser};
@@ -714,6 +799,9 @@ async fn async_main(
 }
 
 fn main() -> Result<(), BoxError> {
+  // Before anything can open a SQLite connection.
+  sqlite_malloc::install();
+
   // Check if the `COMPLETE` env is set to handle dynamic CLI auto-completion.
   CompleteEnv::with_factory(CommandLineArgs::command)
     .bin("trail")
